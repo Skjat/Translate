@@ -1,0 +1,19 @@
+{
+  "name": "krugozor",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Кругозор — PWA с подборкой качественных статей, переводом по тапу и Claude",
+  "type": "module",
+  "scripts": {
+    "vendor": "esbuild scripts/sdk-entry.js --bundle --format=esm --platform=browser --minify --legal-comments=none --banner:js=\"/*! @anthropic-ai/sdk 1.3.0 | Apache-2.0 | https://github.com/anthropics/anthropic-sdk-typescript */\" --outfile=vendor/anthropic-sdk.js && cp node_modules/@anthropic-ai/sdk/LICENSE vendor/LICENSE-anthropic-sdk",
+    "refresh": "node scripts/refresh-articles.mjs",
+    "check": "node scripts/check.mjs",
+    "serve": "node scripts/serve.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "1.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

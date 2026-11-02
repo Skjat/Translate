@@ -1,0 +1,78 @@
+name: Лента и публикация
+
+on:
+  push:
+  schedule:
+    - cron: "23 4 * * *" # каждый день в 04:23 UTC (07:23 МСК)
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Необязательно: найти статьи по запросу (например, «эффективность тренировок»)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Найти свежие статьи
+    if: github.event_name != 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Обновить data/articles.json через Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
+          ARTICLES_PER_RUN: ${{ vars.ARTICLES_PER_RUN }}
+          TOPICS_PER_RUN: ${{ vars.TOPICS_PER_RUN }}
+          DISCOVER_QUERY: ${{ github.event.inputs.query }}
+        run: node scripts/refresh-articles.mjs
+      - run: node scripts/check.mjs
+      - name: Сохранить изменения
+        run: |
+          if git diff --quiet -- data/articles.json; then
+            echo "Лента не изменилась"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/articles.json
+          git commit -m "Лента: свежие статьи $(date -u +%Y-%m-%d)"
+          git push
+
+  deploy:
+    name: Опубликовать на GitHub Pages
+    needs: refresh
+    if: always() && needs.refresh.result != 'failure' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }} # свежий коммит после обновления ленты
+      - name: Собрать сайт
+        run: |
+          mkdir _site
+          cp -r index.html manifest.webmanifest sw.js .nojekyll css js data icons vendor _site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
