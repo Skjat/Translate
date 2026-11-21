@@ -40,7 +40,7 @@ export async function runDiscovery(opts = {}) {
       signal: controller.signal,
     }, onEvent);
     const added = store.addLocalArticles(result.articles);
-    store.setMeta({ lastDiscoverAt: Date.now() });
+    store.setMeta({ lastDiscoverAt: Date.now(), lastDiscoverError: null });
     return {
       added,
       rejected: result.rejected,
@@ -81,15 +81,17 @@ export async function maybeAutoDiscover() {
   const s = store.settings;
   if (!s.autoDiscover || !hasKey() || !navigator.onLine || running) return null;
   const DAY = 864e5;
-  const { lastDiscoverAt } = store.meta();
+  const { lastDiscoverAt, lastAttemptAt } = store.meta();
   const feedAge = Date.now() - (Date.parse(store.feedUpdatedAt() || 0) || 0);
-  if (Date.now() - (lastDiscoverAt || 0) < 20 * 3600e3) return null;
+  if (Date.now() - Math.max(lastDiscoverAt || 0, lastAttemptAt || 0) < 20 * 3600e3) return null;
   if (feedAge < 1.25 * DAY) return null;
   try {
     return await runDiscovery({ count: Math.min(8, s.discoverCount) });
   } catch (err) {
     console.warn('Автопоиск статей:', describeError(err));
-    store.setMeta({ lastDiscoverAt: Date.now() - 18 * 3600e3 }); // повторим не раньше чем через пару часов
+    // Повторим не раньше чем через пару часов; причину покажем в ленте.
+    store.setMeta({ lastAttemptAt: Date.now() - 18 * 3600e3, lastDiscoverError: describeError(err) });
+    store.emit('library');
     return null;
   }
 }

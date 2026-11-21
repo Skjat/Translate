@@ -41,6 +41,7 @@ export const DEFAULT_SETTINGS = {
   chatWebSearch: true,
   fontSize: 18,
   readerProxy: 'https://r.jina.ai/{url}',
+  readerKey: '',
 };
 
 export const settings = { ...DEFAULT_SETTINGS, ...ls.get('settings', {}) };

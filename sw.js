@@ -1,5 +1,5 @@
 // Service worker: офлайн-работа оболочки приложения и ленты.
-const VERSION = 'kz-v1';
+const VERSION = 'kz-v2';
 const SHELL = [
   './',
   'index.html',

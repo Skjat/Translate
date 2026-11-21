@@ -27,14 +27,34 @@ async function viaGoogle(text) {
   return { translation, dict, engine: 'Google' };
 }
 
+/** Приводит регистр перевода к регистру исходника: «bright» → «яркий», а не «Яркий». */
+function matchCase(src, tr) {
+  if (src && src === src.toLowerCase() && tr && !/\s/.test(src)) return tr.charAt(0).toLowerCase() + tr.slice(1);
+  return tr;
+}
+
 async function viaMyMemory(text) {
   const url = `https://api.mymemory.translated.net/get?langpair=en|ru&q=${encodeURIComponent(text.slice(0, 480))}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error('MyMemory: ' + res.status);
   const d = await res.json();
-  const translation = (d.responseData?.translatedText || '').trim();
+  const translation = matchCase(text, (d.responseData?.translatedText || '').trim());
   if (!translation || /MYMEMORY WARNING/i.test(translation)) throw new Error('MyMemory: лимит или пустой ответ');
-  const alts = [...new Set((d.matches || []).map((m) => (m.translation || '').trim()).filter((t) => t && t.toLowerCase() !== translation.toLowerCase()))].slice(0, 4);
+  // MyMemory — память переводов от пользователей, в вариантах бывает мусор. Берём только
+  // точные совпадения приличного качества, без латиницы и не длиннее исходника заметно.
+  const srcWords = text.trim().split(/\s+/).length;
+  const seen = new Set([translation.toLowerCase()]);
+  const alts = [];
+  for (const m of d.matches || []) {
+    const t = matchCase(text, (m.translation || '').trim().replace(/[.!]+$/, ''));
+    const quality = Number.parseInt(m.quality, 10);
+    if (!t || /[a-z]/i.test(t) || seen.has(t.toLowerCase())) continue;
+    if ((m.match ?? 0) < 0.8 || !(quality >= 70)) continue;
+    if (t.split(/\s+/).length > srcWords + 2) continue;
+    seen.add(t.toLowerCase());
+    alts.push(t);
+    if (alts.length >= 4) break;
+  }
   return { translation, dict: alts.length ? [{ pos: 'варианты', terms: alts }] : [], engine: 'MyMemory' };
 }
 

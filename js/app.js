@@ -100,9 +100,34 @@ function discoverBanner() {
     h('button', { class: 'chip', onclick: cancelDiscovery }, 'Стоп'));
 }
 
+/** Когда лента в последний раз пополнялась: общий файл или поиск в приложении. */
+function lastUpdate() {
+  const feed = Date.parse(store.feedUpdatedAt() || 0) || 0;
+  return Math.max(feed, store.meta().lastDiscoverAt || 0) || null;
+}
+
+/** Подсказка, если свежие статьи давно не приходили, — с причиной и действием. */
+function staleBanner() {
+  if (isRunning()) return null;
+  const err = store.meta().lastDiscoverError;
+  if (err) {
+    return h('div', { class: 'banner alert' },
+      h('div', { class: 'banner-text' }, h('b', {}, 'Свежие статьи не загрузились'), h('div', { class: 'muted small' }, err)),
+      h('button', { class: 'chip', onclick: openRefreshSheet }, 'Повторить'));
+  }
+  const age = Date.now() - (lastUpdate() || 0);
+  if (age < 3 * 864e5 || hasKey()) return null;
+  const days = Math.floor(age / 864e5);
+  return h('div', { class: 'banner alert' },
+    h('div', { class: 'banner-text' },
+      h('b', {}, `Лента не пополнялась ${days} ${plural(days, 'день', 'дня', 'дней')}`),
+      h('div', { class: 'muted small' }, 'Добавьте ключ Claude в настройках — приложение будет само находить свежие статьи раз в сутки.')),
+    h('button', { class: 'chip', onclick: () => switchTab('settings') }, 'Настройки'));
+}
+
 function renderFeed() {
   const items = filtered();
-  const updated = store.feedUpdatedAt();
+  const updated = lastUpdate();
   const search = h('input', { class: 'search', type: 'search', placeholder: 'Поиск по статьям и тегам', value: ui.q, enterkeyhint: 'search' });
   search.addEventListener('input', debounce(() => { ui.q = search.value; ui.limit = 30; renderList(); }, 200));
 
@@ -148,6 +173,7 @@ function renderFeed() {
         h('button', { class: 'icon-btn', 'aria-label': 'Спросить Claude', onclick: () => openChat(null) }, '✨'),
         h('button', { class: 'icon-btn', 'aria-label': 'Обновить ленту', onclick: openRefreshSheet }, '↻'))),
     discoverBanner(),
+    staleBanner(),
     search,
     topics,
     filters,
@@ -232,7 +258,8 @@ function openRefreshSheet() {
   mount(layer.body,
     h('section', { class: 'group' },
       h('h3', {}, 'Общая лента'),
-      h('p', { class: 'muted small' }, `Обновляется автоматически раз в сутки (GitHub Action). Последнее обновление: ${fu ? timeAgo(fu) : 'неизвестно'}.`),
+      h('p', { class: 'muted small' }, `Обновляется автоматически раз в сутки (GitHub Action). Последнее обновление: ${fu ? timeAgo(fu) : 'неизвестно'}.`
+        + (fu && Date.now() - Date.parse(fu) > 2 * 864e5 ? ' Если общая лента давно не меняется, проверьте, что в репозитории добавлен секрет ANTHROPIC_API_KEY.' : '')),
       remoteBtn),
     h('section', { class: 'group' },
       h('h3', {}, 'Свежие статьи с Claude'),
@@ -386,6 +413,7 @@ function renderSettings() {
       h('details', {},
         h('summary', {}, 'Дополнительно'),
         field('Сервис извлечения текста', h('input', { type: 'url', value: s.readerProxy, onchange: (e) => store.saveSettings({ readerProxy: e.target.value.trim() || 'https://r.jina.ai/{url}' }) }), '{url} заменяется адресом статьи. По умолчанию Jina Reader.'),
+        field('Ключ Jina Reader (необязательно)', h('input', { type: 'password', autocomplete: 'off', placeholder: 'jina_…', value: s.readerKey, spellcheck: 'false', onchange: (e) => store.saveSettings({ readerKey: e.target.value.trim() }) }), 'Без ключа Jina иногда ограничивает анонимные запросы. Бесплатный ключ — на jina.ai/reader.'),
         field('Адрес Claude API', h('input', { type: 'url', placeholder: 'https://api.anthropic.com', value: s.apiBase, onchange: (e) => store.saveSettings({ apiBase: e.target.value.trim() }) }), 'Оставьте пустым. Нужен, только если вы ходите в API через свой прокси.'))),
     h('section', { class: 'group' },
       h('h3', {}, 'Данные'),

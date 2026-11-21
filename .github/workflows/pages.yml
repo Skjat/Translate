@@ -26,14 +26,27 @@ jobs:
     if: github.event_name != 'push' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Нет ключа Claude — лента не обновляется
+        if: env.HAS_KEY != 'true'
+        run: |
+          msg="Добавьте секрет ANTHROPIC_API_KEY: Settings → Secrets and variables → Actions → New repository secret. Без него свежие статьи в общую ленту не добавляются."
+          echo "::warning title=Лента не обновлена::$msg"
+          echo "### ⚠️ Лента не обновлена" >> "$GITHUB_STEP_SUMMARY"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@v5
+        if: env.HAS_KEY == 'true'
+      - uses: actions/setup-node@v5
+        if: env.HAS_KEY == 'true'
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+        if: env.HAS_KEY == 'true'
       - name: Обновить data/articles.json через Claude
+        if: env.HAS_KEY == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
@@ -42,7 +55,9 @@ jobs:
           DISCOVER_QUERY: ${{ github.event.inputs.query }}
         run: node scripts/refresh-articles.mjs
       - run: node scripts/check.mjs
+        if: env.HAS_KEY == 'true'
       - name: Сохранить изменения
+        if: env.HAS_KEY == 'true'
         run: |
           if git diff --quiet -- data/articles.json; then
             echo "Лента не изменилась"
@@ -63,16 +78,36 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Проверить, включён ли GitHub Pages
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/pages")
+          if [ "$code" = "200" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            msg="GitHub Pages не включён (ответ API: $code). Откройте Settings → Pages → Build and deployment → Source и выберите «GitHub Actions», затем перезапустите этот workflow."
+            echo "::warning title=Сайт не опубликован::$msg"
+            echo "### ⚠️ Сайт не опубликован" >> "$GITHUB_STEP_SUMMARY"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@v5
+        if: steps.pages.outputs.enabled == 'true'
         with:
           ref: ${{ github.ref_name }} # свежий коммит после обновления ленты
       - name: Собрать сайт
+        if: steps.pages.outputs.enabled == 'true'
         run: |
           mkdir _site
           cp -r index.html manifest.webmanifest sw.js .nojekyll css js data icons vendor _site/
       - uses: actions/configure-pages@v5
+        if: steps.pages.outputs.enabled == 'true'
       - uses: actions/upload-pages-artifact@v3
+        if: steps.pages.outputs.enabled == 'true'
         with:
           path: _site
       - id: deployment
+        if: steps.pages.outputs.enabled == 'true'
         uses: actions/deploy-pages@v4
