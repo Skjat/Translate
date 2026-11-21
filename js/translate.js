@@ -1,10 +1,12 @@
 // Перевод на русский по тапу на слово или по выделению текста.
 import { settings, ls } from './store.js';
-import { h, debounce } from './ui.js';
+import { h, debounce, toast } from './ui.js';
+import { addWord, findWord, removeWord } from './vocab.js';
 import { getClient, hasKey } from './claude.js';
 import { buildRequest, streamWithRecovery, describeError } from './claude-core.js';
 
 const containers = new Set();
+const containerMeta = new WeakMap(); // контейнер → { article }
 const WORD_CHAR = /[\p{L}\p{M}\p{N}'’\-]/u;
 const LATIN = /[a-z]/i;
 const CYRILLIC = /[а-яё]/i;
@@ -125,6 +127,98 @@ export function clearTranslationCache() {
   ls.del('tcache');
 }
 
+// ---------- перевод абзацев ----------
+const BLOCK_SEL = 'p, li, blockquote, h2, h3, h4, td, figcaption';
+
+/** Режет длинный текст на куски по предложениям (бесплатные сервисы плохо принимают длинные запросы). */
+function chunks(text, max = 450) {
+  const sentences = text.match(/[^.!?…]+[.!?…]*["»”’)]*\s*/g) || [text];
+  const out = [];
+  let cur = '';
+  for (let sent of sentences) {
+    while (sent.length > max) { // очень длинное предложение — режем по пробелам
+      const cut = sent.lastIndexOf(' ', max) > 0 ? sent.lastIndexOf(' ', max) : max;
+      if (cur) { out.push(cur); cur = ''; }
+      out.push(sent.slice(0, cut));
+      sent = sent.slice(cut);
+    }
+    if ((cur + sent).length > max && cur) { out.push(cur); cur = ''; }
+    cur += sent;
+  }
+  if (cur.trim()) out.push(cur);
+  return out.map((c) => c.trim()).filter(Boolean);
+}
+
+/** Перевод длинного текста (абзаца). Через Claude — целиком, через бесплатные сервисы — по кускам. */
+export async function translateLong(text) {
+  text = text.replace(/\s+/g, ' ').trim();
+  if (settings.translateEngine === 'claude' && hasKey()) return (await translate(text, '')).translation;
+  const parts = [];
+  for (const c of chunks(text)) parts.push((await translate(c, '')).translation);
+  return parts.join(' ');
+}
+
+const isEnglish = (text) => {
+  const latin = (text.match(/[a-z]/gi) || []).length;
+  const cyr = (text.match(/[а-яё]/gi) || []).length;
+  return latin > 20 && latin > cyr * 3;
+};
+
+/** Показывает перевод абзаца прямо под ним. Повторный вызов с toggle убирает перевод. */
+export async function translateBlock(block, { toggle = false } = {}) {
+  if (block._tr?.isConnected) {
+    if (toggle) { block._tr.remove(); block._tr = null; }
+    return;
+  }
+  const text = (block.textContent || '').trim();
+  if (!isEnglish(text)) return;
+  const box = h('div', { class: 'para-tr no-translate', title: 'Нажмите, чтобы скрыть перевод' }, 'Перевожу абзац…');
+  box.addEventListener('click', () => { box.remove(); block._tr = null; });
+  if (block.tagName === 'LI' || block.tagName === 'TD') block.append(box);
+  else block.after(box);
+  block._tr = box;
+  try {
+    box.textContent = await translateLong(text);
+  } catch (err) {
+    box.classList.add('error');
+    box.textContent = 'Не удалось перевести абзац: ' + (err?.message || err);
+  }
+}
+
+// Параллельный перевод: абзацы переводятся по мере появления на экране, не больше двух сразу.
+const queue = [];
+let inFlight = 0;
+function pump() {
+  while (inFlight < 2 && queue.length) {
+    const block = queue.shift();
+    if (!block.isConnected || block._tr) continue;
+    inFlight++;
+    translateBlock(block).finally(() => { inFlight--; pump(); });
+  }
+}
+
+/** Включает параллельный перевод для контейнера. Возвращает функцию выключения. */
+export function startParallel(container) {
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      io.unobserve(e.target);
+      queue.push(e.target);
+    }
+    pump();
+  }, { rootMargin: '200px 0px' });
+  for (const block of container.querySelectorAll(BLOCK_SEL)) {
+    if (block.closest('.para-tr, .no-translate') || block.querySelector(BLOCK_SEL)) continue;
+    if (isEnglish(block.textContent || '')) io.observe(block);
+  }
+  return () => {
+    io.disconnect();
+    queue.length = 0;
+    for (const box of container.querySelectorAll('.para-tr')) box.remove();
+    for (const block of container.querySelectorAll(BLOCK_SEL)) block._tr = null;
+  };
+}
+
 // ---------- карточка перевода ----------
 let card = null;
 let mark = null;
@@ -157,7 +251,7 @@ function speak(text) {
   } catch { /* озвучка недоступна */ }
 }
 
-function renderCard({ text, context, state, result, error }) {
+function renderCard({ text, context, state, result, error, block, article }) {
   ensureCard();
   const isPhrase = /\s/.test(text.trim());
   const head = h('div', { class: 'tr-head' },
@@ -179,11 +273,38 @@ function renderCard({ text, context, state, result, error }) {
   }
 
   const canClaude = result?.engine !== 'Claude';
+  let vocabBtn = null;
+  if (state === 'done' && text.length <= 60) {
+    const saved = !!findWord(text);
+    vocabBtn = h('button', { class: 'chip' + (saved ? ' active' : '') }, saved ? '✓ В словаре' : '★ В словарь');
+    vocabBtn.onclick = () => {
+      const existing = findWord(text);
+      if (existing) {
+        removeWord(existing.id);
+        toast('Убрано из словаря', { timeout: 1200 });
+      } else {
+        addWord({
+          word: text,
+          translation: result.translation,
+          alts: (result.dict || []).flatMap((d) => d.terms).filter((t) => t !== result.translation).slice(0, 4),
+          note: result.note || '',
+          context,
+          article,
+        });
+        toast('Добавлено в словарь — повторить можно во вкладке «Моё»', { timeout: 1800 });
+      }
+      renderCard({ text, context, state, result, error, block, article });
+    };
+  }
   const actions = h('div', { class: 'tr-actions' },
+    vocabBtn,
+    block?.isConnected && state !== 'loading'
+      ? h('button', { class: 'chip', onclick: () => { hideTranslation(); translateBlock(block, { toggle: true }); } }, block._tr ? '¶ Скрыть абзац' : '¶ Абзац')
+      : null,
     canClaude && state !== 'loading'
       ? h('button', {
         class: 'chip accent',
-        onclick: () => show(text, context, { forceClaude: true }),
+        onclick: () => show(text, context, { forceClaude: true, block, article }),
       }, '✨ В контексте')
       : null,
     h('button', {
@@ -197,24 +318,25 @@ function renderCard({ text, context, state, result, error }) {
   card.classList.add('show');
 }
 
-async function show(text, context = '', { forceClaude = false, rect = null } = {}) {
+async function show(text, context = '', { forceClaude = false, rect = null, block = null, article = null } = {}) {
   text = text.trim();
   if (!text) return;
   current = text;
   const seq = ++requestSeq;
   if (rect) placeMark(rect);
+  const base = { text, context, block, article };
   if (forceClaude && !hasKey()) {
-    renderCard({ text, context, state: 'error', error: 'Для перевода в контексте добавьте API-ключ Claude в настройках.' });
+    renderCard({ ...base, state: 'error', error: 'Для перевода в контексте добавьте API-ключ Claude в настройках.' });
     return;
   }
-  renderCard({ text, context, state: 'loading' });
+  renderCard({ ...base, state: 'loading' });
   try {
     const result = await translate(text, context, { forceClaude });
     if (seq !== requestSeq) return;
-    renderCard({ text, context, state: 'done', result });
+    renderCard({ ...base, state: 'done', result });
   } catch (err) {
     if (seq !== requestSeq) return;
-    renderCard({ text, context, state: 'error', error: err?.code === 'NO_KEY' || err?.status ? describeError(err) : 'Не удалось перевести: ' + (err?.message || err) });
+    renderCard({ ...base, state: 'error', error: err?.code === 'NO_KEY' || err?.status ? describeError(err) : 'Не удалось перевести: ' + (err?.message || err) });
   }
 }
 
@@ -265,7 +387,7 @@ function sentenceAround(node, word) {
 
 function onTap(e) {
   if (!settings.tapTranslate) return;
-  if (e.target.closest('a, button, input, textarea, select, img, .no-translate, .tr-card')) return;
+  if (e.target.closest('a, button, input, textarea, select, img, .no-translate, .tr-card, .para-tr')) return;
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed && sel.toString().trim()) return;
   const range = caretRange(e.clientX, e.clientY);
@@ -279,7 +401,13 @@ function onTap(e) {
   const rect = r.getBoundingClientRect();
   // Палец должен попасть в само слово, а не в пустое место рядом.
   if (e.clientX < rect.left - 12 || e.clientX > rect.right + 12 || e.clientY < rect.top - 12 || e.clientY > rect.bottom + 12) { hideTranslation(); return; }
-  show(w.word, sentenceAround(node, w.word), { rect });
+  const container = e.currentTarget;
+  const block = node.parentElement?.closest(BLOCK_SEL);
+  show(w.word, sentenceAround(node, w.word), {
+    rect,
+    block: block && container.contains(block) ? block : null,
+    article: containerMeta.get(container)?.article || null,
+  });
 }
 
 const onSelection = debounce(() => {
@@ -289,18 +417,20 @@ const onSelection = debounce(() => {
   if (!text || text.length > 1500 || !LATIN.test(text) || text === current) return;
   if ((text.match(/[а-яё]/gi) || []).length > text.length / 3) return; // это русский текст
   const anchor = sel.anchorNode;
-  const inside = [...containers].some((c) => c.isConnected && c.contains(anchor));
-  if (!inside) return;
+  const container = [...containers].find((c) => c.isConnected && c.contains(anchor));
+  if (!container) return;
   mark?.classList.remove('show');
   const context = anchor?.nodeType === Node.TEXT_NODE && text.length < 80 ? sentenceAround(anchor, text.split(' ')[0]) : '';
-  show(text, context);
+  const block = (anchor?.nodeType === Node.TEXT_NODE ? anchor.parentElement : anchor)?.closest?.(BLOCK_SEL);
+  show(text, context, { block: block && container.contains(block) ? block : null, article: containerMeta.get(container)?.article || null });
 }, 550);
 
 let globalBound = false;
 
 /** Включает перевод по тапу/выделению внутри контейнера. */
-export function attachTranslator(container) {
+export function attachTranslator(container, { article = null } = {}) {
   containers.add(container);
+  containerMeta.set(container, { article });
   container.classList.add('translatable');
   container.addEventListener('click', onTap);
   if (!globalBound) {

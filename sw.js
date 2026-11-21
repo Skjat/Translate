@@ -1,5 +1,5 @@
 // Service worker: офлайн-работа оболочки приложения и ленты.
-const VERSION = 'kz-v2';
+const VERSION = 'kz-v3';
 const SHELL = [
   './',
   'index.html',
@@ -19,6 +19,9 @@ const SHELL = [
   'js/translate.js',
   'js/reader.js',
   'js/chat.js',
+  'js/vocab.js',
+  'js/vocab-ui.js',
+  'js/backup.js',
   'vendor/anthropic-sdk.js',
   'data/articles.json',
   'icons/icon.svg',

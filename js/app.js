@@ -2,7 +2,10 @@
 import { h, $, mount, toast, openLayer, fmtDate, timeAgo, plural, debounce, shuffle } from './ui.js';
 import * as store from './store.js';
 import { TOPICS, topicById } from './topics.js';
-import { openReader } from './reader.js';
+import { openReader, isCached, loadCachedIds, prefetchText, forgetCached, isProtectedHost } from './reader.js';
+import { renderVocab } from './vocab-ui.js';
+import { dueWords } from './vocab.js';
+import { exportBackup, importBackup, storageStatus } from './backup.js';
 import { openChat, listChats } from './chat.js';
 import { runDiscovery, cancelDiscovery, isRunning, runningLabel, refreshRemote, maybeAutoDiscover } from './discover.js';
 import { pickStaleTopics } from './discover-core.js';
@@ -32,6 +35,8 @@ function articleCard(a, { compact = false } = {}) {
   const t = topicById(a.topic);
   const saved = store.isSaved(a.id);
   const read = store.isRead(a.id);
+  const pr = store.getProgress(a.id);
+  const progress = pr && pr.p >= 0.05 && !read ? pr.p : 0;
   const meta = h('div', { class: 'card-meta' },
     h('button', { class: 'topic-pill', onclick: (e) => { e.stopPropagation(); setFilter({ topic: a.topic }); } }, `${t.emoji} ${t.short}`),
     h('span', {}, a.source),
@@ -39,7 +44,8 @@ function articleCard(a, { compact = false } = {}) {
     a.reading_minutes ? h('span', {}, `${a.reading_minutes} мин`) : null,
     h('span', { class: 'lang' }, a.lang.toUpperCase()),
     store.isNew(a) ? h('span', { class: 'badge new' }, 'новое') : null,
-    a.kind === 'longread' ? h('span', { class: 'badge' }, 'лонгрид') : null);
+    a.kind === 'longread' ? h('span', { class: 'badge' }, 'лонгрид') : null,
+    saved && isCached(a.id) ? h('span', { class: 'badge offline', title: 'Текст сохранён — можно читать без сети' }, '📥 офлайн') : null);
 
   const saveBtn = h('button', { class: 'icon-btn small' + (saved ? ' on' : ''), 'aria-label': 'В избранное' }, saved ? '★' : '☆');
   saveBtn.onclick = (e) => {
@@ -47,7 +53,7 @@ function articleCard(a, { compact = false } = {}) {
     const on = store.toggleSaved(a);
     saveBtn.textContent = on ? '★' : '☆';
     saveBtn.classList.toggle('on', on);
-    toast(on ? 'Добавлено в избранное' : 'Убрано из избранного', { timeout: 1200 });
+    toast(on ? 'В избранном — текст сохранится для чтения без сети' : 'Убрано из избранного', { timeout: 1400 });
   };
 
   return h('article', { class: 'card' + (read ? ' read' : ''), onclick: () => openReader(a) },
@@ -65,7 +71,8 @@ function articleCard(a, { compact = false } = {}) {
       h('button', { class: 'btn small accent', onclick: (e) => { e.stopPropagation(); openChat(a); } }, '✨ Claude'),
       h('a', { class: 'btn small ghost', href: a.url, target: '_blank', rel: 'noopener', onclick: (e) => { e.stopPropagation(); store.markRead(a.id); } }, '↗'),
       h('span', { class: 'spacer' }),
-      saveBtn));
+      saveBtn),
+    progress ? h('div', { class: 'card-progress', title: `Прочитано ${Math.round(progress * 100)}%` }, h('span', { style: { width: Math.round(progress * 100) + '%' } })) : null);
 }
 
 function setFilter(patch) {
@@ -158,6 +165,16 @@ function renderList() {
 }
 const renderListSoon = debounce(renderList, 200);
 
+/** «Продолжить чтение» — начатые статьи, только когда фильтры не выбраны. */
+function continueBlock() {
+  if (ui.q || ui.tag || ui.topic !== 'all' || ui.queriesOnly) return null;
+  const items = store.inProgress().slice(0, 3);
+  if (!items.length) return null;
+  return h('section', { class: 'continue' },
+    h('div', { class: 'section-title' }, '📖 Продолжить чтение'),
+    h('div', { class: 'list' }, items.map((a) => articleCard(a, { compact: true }))));
+}
+
 /** Обновляет счётчик, баннеры, темы и список, не трогая поле поиска (клавиатура не закрывается). */
 function updateFeed() {
   if (!feedRefs || !view.contains(feedRefs.listEl)) { renderFeed(); return; }
@@ -166,6 +183,7 @@ function updateFeed() {
   const total = filtered().length;
   headInfo.textContent = `${total} ${plural(total, 'статья', 'статьи', 'статей')} · лента обновлена ${updated ? timeAgo(updated) : '—'}`;
   mount(bannerSlot, discoverBanner(), staleBanner());
+  mount(feedRefs.continueSlot, continueBlock());
   const hasQueries = store.library().some((a) => a.query);
   if (hasQueries !== feedRefs.hasQueries) {
     feedRefs.hasQueries = hasQueries;
@@ -193,7 +211,8 @@ function renderFeed() {
   const bannerSlot = h('div');
   const topicsSlot = h('div', {}, topicChips());
   const listEl = h('div', { class: 'list' });
-  feedRefs = { headInfo, bannerSlot, topicsSlot, listEl, hasQueries: store.library().some((a) => a.query) };
+  const continueSlot = h('div');
+  feedRefs = { headInfo, bannerSlot, topicsSlot, listEl, continueSlot, hasQueries: store.library().some((a) => a.query) };
 
   mount(view,
     h('header', { class: 'page-head' },
@@ -205,6 +224,7 @@ function renderFeed() {
     search,
     topicsSlot,
     filters,
+    continueSlot,
     listEl,
   );
   updateFeed();
@@ -348,19 +368,63 @@ function renderRandom() {
 }
 
 // ---------- Избранное ----------
+let offlineRun = null; // идёт ли «Скачать всё»
+
+/** Докачивает тексты избранных статей для чтения без сети (по одной, бережно к сервису). */
+async function prefetchSaved({ onProgress } = {}) {
+  if (offlineRun || !navigator.onLine) return offlineRun;
+  offlineRun = (async () => {
+    const todo = store.savedArticles().filter((a) => !isCached(a.id) && !isProtectedHost(a.url));
+    let ok = 0;
+    for (const [i, a] of todo.entries()) {
+      onProgress?.(i, todo.length);
+      if (await prefetchText(a)) ok++;
+      if (i < todo.length - 1) await new Promise((r) => setTimeout(r, 2500));
+    }
+    return { ok, total: todo.length };
+  })();
+  try {
+    return await offlineRun;
+  } finally {
+    offlineRun = null;
+  }
+}
+
+function savedHeader(items) {
+  if (!items.length) return null;
+  const cached = items.filter((a) => isCached(a.id)).length;
+  const missing = items.filter((a) => !isCached(a.id) && !isProtectedHost(a.url)).length;
+  const status = h('span', { class: 'muted small' }, `📥 без сети доступно: ${cached} из ${items.length}`);
+  const btn = missing && navigator.onLine
+    ? h('button', { class: 'btn small', onclick: async () => {
+      btn.disabled = true;
+      await prefetchSaved({ onProgress: (i, n) => { btn.textContent = `Скачиваю ${i + 1} из ${n}…`; } });
+      renderSaved();
+    } }, offlineRun ? 'Скачиваю…' : `Скачать ещё ${missing}`)
+    : null;
+  return h('div', { class: 'saved-head' }, status, btn);
+}
+
 async function renderSaved() {
   const seg = (value, label) => h('button', { class: ui.savedSeg === value ? 'active' : '', onclick: () => { ui.savedSeg = value; renderSaved(); } }, label);
+  const due = dueWords().length;
   const list = h('div', { class: 'list' });
   mount(view,
     h('header', { class: 'page-head' }, h('div', {}, h('h1', {}, 'Моё'))),
-    h('div', { class: 'segmented wide' }, seg('saved', 'Избранное'), seg('read', 'Прочитанное'), seg('chats', 'Чаты')),
+    h('div', { class: 'segmented wide' },
+      seg('saved', 'Избранное'),
+      seg('vocab', due ? `Словарь · ${due}` : 'Словарь'),
+      seg('read', 'Прочитано'),
+      seg('chats', 'Чаты')),
     list);
   if (ui.savedSeg === 'saved') {
     const items = store.savedArticles();
-    list.append(...(items.length ? items.map((a) => articleCard(a)) : [h('div', { class: 'empty' }, 'Нажмите ☆ на карточке, чтобы сохранить статью.')]));
+    mount(list, savedHeader(items), ...(items.length ? items.map((a) => articleCard(a)) : [h('div', { class: 'empty' }, 'Нажмите ☆ на карточке, чтобы сохранить статью. Текст избранных статей скачивается заранее — их можно читать без сети.')]));
+  } else if (ui.savedSeg === 'vocab') {
+    renderVocab(list);
   } else if (ui.savedSeg === 'read') {
     const items = store.readArticles();
-    list.append(...(items.length ? items.map((a) => articleCard(a, { compact: true })) : [h('div', { class: 'empty' }, 'Здесь появятся прочитанные статьи.')]));
+    list.append(...(items.length ? items.map((a) => articleCard(a, { compact: true })) : [h('div', { class: 'empty' }, 'Здесь появятся дочитанные статьи.')]));
   } else {
     const chats = await listChats();
     if (!chats.length) list.append(h('div', { class: 'empty' }, 'Разговоров с Claude пока нет.'));
@@ -373,6 +437,17 @@ async function renderSaved() {
         h('span', { class: 'chat-del', role: 'button', 'aria-label': 'Удалить', onclick: async (e) => { e.stopPropagation(); if (confirm('Удалить разговор?')) { await kv.del(key); renderSaved(); } } }, '🗑')));
     }
   }
+}
+
+/** Точка с числом слов к повторению на вкладке «Моё». */
+function updateTabBadge() {
+  const btn = document.querySelector('.tabbar button[data-tab="saved"]');
+  if (!btn) return;
+  const n = dueWords().length;
+  let badge = btn.querySelector('.tab-badge');
+  if (!n) { badge?.remove(); return; }
+  if (!badge) { badge = h('span', { class: 'tab-badge' }); btn.append(badge); }
+  badge.textContent = n > 99 ? '99+' : String(n);
 }
 
 // ---------- Настройки ----------
@@ -444,10 +519,11 @@ function renderSettings() {
         field('Сервис извлечения текста', h('input', { type: 'url', value: s.readerProxy, onchange: (e) => store.saveSettings({ readerProxy: e.target.value.trim() || 'https://r.jina.ai/{url}' }) }), '{url} заменяется адресом статьи. По умолчанию Jina Reader.'),
         field('Ключ Jina Reader (необязательно)', h('input', { type: 'password', autocomplete: 'off', placeholder: 'jina_…', value: s.readerKey, spellcheck: 'false', onchange: (e) => store.saveSettings({ readerKey: e.target.value.trim() }) }), 'Без ключа Jina иногда ограничивает анонимные запросы. Бесплатный ключ — на jina.ai/reader.'),
         field('Адрес Claude API', h('input', { type: 'url', placeholder: 'https://api.anthropic.com', value: s.apiBase, onchange: (e) => store.saveSettings({ apiBase: e.target.value.trim() }) }), 'Оставьте пустым. Нужен, только если вы ходите в API через свой прокси.'))),
+    backupSection(),
     h('section', { class: 'group' },
       h('h3', {}, 'Данные'),
       h('div', { class: 'row wrap' },
-        h('button', { class: 'btn', onclick: async () => { await kv.clear('reader:'); clearTranslationCache(); store.ls.del('protectedHosts'); toast('Кэш текстов и переводов очищен'); } }, 'Очистить кэш'),
+        h('button', { class: 'btn', onclick: async () => { await kv.clear('reader:'); forgetCached(); clearTranslationCache(); store.ls.del('protectedHosts'); toast('Кэш текстов и переводов очищен'); } }, 'Очистить кэш'),
         h('button', { class: 'btn danger', onclick: async () => {
           if (!confirm('Удалить все данные приложения на этом устройстве, включая API-ключ, избранное и чаты?')) return;
           store.resetAll();
@@ -456,6 +532,43 @@ function renderSettings() {
         } }, 'Сбросить всё'))),
     h('p', { class: 'muted small center' }, 'Кругозор · статьи для расширения кругозора · Claude: ', modelInfo(s.model).label),
   );
+}
+
+function backupSection() {
+  const includeKeys = h('input', { type: 'checkbox' });
+  const status = h('p', { class: 'hint' }, 'Проверяю хранилище…');
+  storageStatus().then(({ persisted, standalone }) => {
+    status.textContent = persisted
+      ? '✅ Данные хранятся постоянно. Резервная копия пригодится при переходе на другой телефон.'
+      : standalone
+        ? 'iOS может очистить данные при нехватке места — время от времени сохраняйте резервную копию.'
+        : '⚠️ Сайт открыт во вкладке Safari: если не заходить 7 дней, Safari может стереть ключ, избранное и словарь. Установите приложение на экран «Домой» и сохраняйте резервную копию.';
+  });
+  const file = h('input', { type: 'file', accept: 'application/json,.json', style: { display: 'none' } });
+  file.addEventListener('change', async () => {
+    const f = file.files?.[0];
+    file.value = '';
+    if (!f) return;
+    try {
+      const st = await importBackup(f);
+      toast(`Восстановлено: избранное +${st.saved}, слов +${st.words}, чатов ${st.chats}, статей +${st.articles}. Перезапускаю…`, { timeout: 2500 });
+      setTimeout(() => location.reload(), 1800);
+    } catch (err) {
+      toast('Не удалось восстановить: ' + (err.message || err), { timeout: 5000 });
+    }
+  });
+  return h('section', { class: 'group' },
+    h('h3', {}, 'Резервная копия'),
+    status,
+    h('label', { class: 'toggle-label' }, includeKeys, 'Включить в копию API-ключи'),
+    h('p', { class: 'hint' }, 'В копию входят избранное, прочитанное, место в статьях, словарь, найденные статьи, чаты с Claude и настройки. Файл с ключами храните в надёжном месте.'),
+    h('div', { class: 'row wrap' },
+      h('button', { class: 'btn accent', onclick: async () => {
+        const r = await exportBackup({ includeKeys: includeKeys.checked }).catch((err) => { toast('Не удалось сохранить копию: ' + err.message, { timeout: 4000 }); return null; });
+        if (r === 'downloaded') toast('Файл копии сохранён в «Загрузки»', { timeout: 2500 });
+      } }, '💾 Сохранить копию'),
+      h('button', { class: 'btn', onclick: () => file.click() }, '📂 Восстановить из файла')),
+    file);
 }
 
 // ---------- вкладки ----------
@@ -482,7 +595,22 @@ document.querySelector('.tabbar').addEventListener('click', (e) => {
 });
 
 store.on('library', debounce(rerender, 50));
-store.on('saved', () => { if (ui.tab === 'saved') renderSaved(); });
+store.on('saved', (id) => {
+  // Избранное скачиваем заранее, чтобы читать без сети.
+  if (store.isSaved(id) && navigator.onLine) prefetchText(store.getArticle(id));
+  if (ui.tab === 'saved') renderSaved();
+});
+store.on('offline', debounce(() => { if (ui.tab === 'saved' && ui.savedSeg === 'saved') renderSaved(); }, 300));
+store.on('vocab', () => {
+  updateTabBadge();
+  if (ui.tab === 'saved' && ui.savedSeg === 'vocab') renderSaved();
+});
+const refreshAfterReading = debounce(() => {
+  if (ui.tab === 'feed') updateFeed();
+  else if (ui.tab === 'saved') renderSaved();
+}, 300);
+store.on('read', refreshAfterReading);
+store.on('reader-closed', refreshAfterReading);
 store.on('discover-state', (st) => {
   if (!st.running) ui.discoverLog = [];
   if (ui.tab === 'feed') updateFeed();
@@ -507,13 +635,16 @@ async function boot() {
   store.init();
   // Просим не вытеснять данные (ключ, избранное, чаты) при нехватке места.
   navigator.storage?.persist?.().catch(() => {});
+  await loadCachedIds().catch(() => {});
   switchTab('feed');
+  updateTabBadge();
   const hadFeed = !!store.meta().fetchedAt;
   const n = await refreshRemote();
   if (n > 0 && hadFeed) toast(`В ленте ${n} ${plural(n, 'новая статья', 'новые статьи', 'новых статей')}`);
   installHint();
   const auto = await maybeAutoDiscover();
   if (auto?.added?.length) toast(`Claude нашёл ${auto.added.length} ${plural(auto.added.length, 'свежую статью', 'свежие статьи', 'свежих статей')}`);
+  prefetchSaved(); // докачать избранное, если что-то не успело скачаться
 }
 
 // При возвращении в приложение (iOS держит PWA в фоне) — подтягиваем свежую ленту.

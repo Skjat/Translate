@@ -42,6 +42,7 @@ export const DEFAULT_SETTINGS = {
   fontSize: 18,
   readerProxy: 'https://r.jina.ai/{url}',
   readerKey: '',
+  parallel: false,
 };
 
 export const settings = { ...DEFAULT_SETTINGS, ...ls.get('settings', {}) };
@@ -76,6 +77,7 @@ const state = {
   read: ls.get('read', {}), // id -> ts
   firstSeen: ls.get('firstSeen', null), // id -> ts (для метки «новое»)
   meta: ls.get('meta', { fetchedAt: 0, lastDiscoverAt: 0 }),
+  progress: ls.get('progress', {}), // id -> { p: доля прочитанного 0..1, para: индекс абзаца, ts }
 };
 
 let libraryCache = null;
@@ -110,7 +112,7 @@ function touchLibrary() {
 
 export function isNew(a) {
   const ts = state.firstSeen?.[a.id];
-  return !!ts && Date.now() - ts < 3 * 864e5 && !state.read[a.id];
+  return !!ts && Date.now() - ts < 3 * 864e5 && !state.read[a.id] && !state.progress[a.id];
 }
 
 export const feedUpdatedAt = () => state.remote.updated_at;
@@ -163,6 +165,35 @@ export function markRead(id, value = true) {
   emit('read', id);
 }
 
+// ---- место в статье («Продолжить чтение») ----
+export const getProgress = (id) => state.progress[id] || null;
+
+const saveProgressSoon = (() => {
+  let t;
+  return () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      // Храним не больше 300 последних статей.
+      const entries = Object.entries(state.progress).sort((a, b) => b[1].ts - a[1].ts).slice(0, 300);
+      state.progress = Object.fromEntries(entries);
+      ls.set('progress', state.progress);
+    }, 400);
+  };
+})();
+
+export function setProgress(id, { p, para }) {
+  state.progress[id] = { p: Math.max(0, Math.min(1, p)), para: para | 0, ts: Date.now() };
+  saveProgressSoon();
+}
+
+/** Начатые, но не дочитанные статьи — от последней открытой. */
+export const inProgress = () =>
+  Object.entries(state.progress)
+    .filter(([id, pr]) => pr.p >= 0.05 && !state.read[id])
+    .sort((a, b) => b[1].ts - a[1].ts)
+    .map(([id]) => getArticle(id))
+    .filter(Boolean);
+
 export const savedArticles = () =>
   Object.values(state.saved).sort((a, b) => b.ts - a.ts).map((s) => getArticle(s.article.id) || s.article);
 
@@ -174,5 +205,5 @@ export function init() {
 }
 
 export function resetAll() {
-  for (const key of ['feed', 'local', 'saved', 'read', 'firstSeen', 'meta', 'settings', 'tcache']) ls.del(key);
+  for (const key of ['feed', 'local', 'saved', 'read', 'firstSeen', 'meta', 'settings', 'tcache', 'progress', 'vocab', 'protectedHosts', 'hint.tap', 'hint.install']) ls.del(key);
 }

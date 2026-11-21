@@ -4,7 +4,7 @@ import { renderMarkdown } from './markdown.js';
 import { kv } from './db.js';
 import * as store from './store.js';
 import { topicById } from './topics.js';
-import { attachTranslator, hideTranslation } from './translate.js';
+import { attachTranslator, hideTranslation, startParallel } from './translate.js';
 import { openChat } from './chat.js';
 
 const MIN_FONT = 14;
@@ -13,6 +13,28 @@ const MAX_FONT = 26;
 export async function getCachedText(id) {
   const c = await kv.get('reader:' + id);
   return c?.md || '';
+}
+
+// ---- офлайн: какие статьи уже скачаны ----
+const cachedIds = new Set();
+export const isCached = (id) => cachedIds.has(id);
+export async function loadCachedIds() {
+  for (const k of await kv.keys('reader:')) cachedIds.add(k.slice(7));
+}
+export function forgetCached() {
+  cachedIds.clear();
+}
+
+/** Скачивает текст статьи заранее (для офлайн-чтения избранного). Возвращает true при успехе. */
+export async function prefetchText(article) {
+  if (!article || cachedIds.has(article.id)) return true;
+  try {
+    await loadText(article);
+    store.emit('offline', article.id);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Чистит ответ Jina Reader (или похожего прокси) до Markdown основного текста. */
@@ -117,16 +139,22 @@ async function loadText(article, { force = false } = {}) {
   }
   rememberProtected(article.url, false);
   await kv.set('reader:' + article.id, { md, ts: Date.now() });
+  cachedIds.add(article.id);
   return md;
 }
 
 export function openReader(article) {
-  store.markRead(article.id);
   const t = topicById(article.topic);
   const s = store.settings;
+  const openedAt = Date.now();
+  const isForeign = article.lang !== 'ru';
 
   const saveBtn = h('button', { class: 'icon-btn', 'aria-label': 'В избранное' }, store.isSaved(article.id) ? '★' : '☆');
-  saveBtn.onclick = () => { saveBtn.textContent = store.toggleSaved(article) ? '★' : '☆'; };
+  saveBtn.onclick = () => {
+    const on = store.toggleSaved(article);
+    saveBtn.textContent = on ? '★' : '☆';
+    toast(on ? 'В избранном — текст сохранится для чтения без сети' : 'Убрано из избранного', { timeout: 1600 });
+  };
   const trBtn = h('button', { class: 'icon-btn tr-toggle' + (s.tapTranslate ? ' on' : ''), 'aria-label': 'Перевод по тапу' }, 'A/Я');
   trBtn.onclick = () => {
     store.saveSettings({ tapTranslate: !store.settings.tapTranslate });
@@ -134,15 +162,26 @@ export function openReader(article) {
     if (!store.settings.tapTranslate) hideTranslation();
     toast(store.settings.tapTranslate ? 'Перевод по тапу включён' : 'Перевод по тапу выключен', { timeout: 1500 });
   };
+  const parBtn = isForeign ? h('button', { class: 'icon-btn' + (s.parallel ? ' on' : ''), 'aria-label': 'Параллельный перевод' }, '⇄') : null;
   const fontBtn = h('button', { class: 'icon-btn', 'aria-label': 'Размер шрифта' }, 'Aa');
 
+  let stopParallel = null;
+  let loaded = false;
   const layer = openLayer({
     kind: 'page',
     title: article.source,
     className: 'reader',
-    actions: [trBtn, fontBtn, saveBtn],
-    onClose: () => { hideTranslation(); detach(); },
+    actions: [trBtn, parBtn, fontBtn, saveBtn],
+    onClose: () => {
+      saveProgress();
+      setTimeout(() => store.emit('reader-closed', article.id), 450); // после записи прогресса
+      clearTimeout(readTimer);
+      hideTranslation();
+      detach();
+      stopParallel?.();
+    },
   });
+  const body = layer.body;
 
   const wrap = h('div', { class: 'reader-wrap', style: { fontSize: s.fontSize + 'px' } });
   fontBtn.onclick = () => {
@@ -151,6 +190,16 @@ export function openReader(article) {
     wrap.style.fontSize = next + 'px';
     toast(`Размер текста: ${next}`, { timeout: 1000 });
   };
+  if (parBtn) {
+    parBtn.onclick = () => {
+      const on = !store.settings.parallel;
+      store.saveSettings({ parallel: on });
+      parBtn.classList.toggle('on', on);
+      if (on && loaded) stopParallel = startParallel(content);
+      if (!on) { stopParallel?.(); stopParallel = null; }
+      toast(on ? 'Параллельный перевод: под каждым абзацем — перевод' : 'Параллельный перевод выключен', { timeout: 1600 });
+    };
+  }
 
   const meta = [
     `${t.emoji} ${t.short}`,
@@ -161,23 +210,78 @@ export function openReader(article) {
 
   const content = h('div', { class: 'reader-content' }, skeleton());
   const titleEl = h('h1', { class: 'reader-title' }, article.title);
+  // Открытие оригинала в Safari тоже считаем прочтением.
+  const original = (label, cls = 'btn') => h('a', { class: cls, href: article.url, target: '_blank', rel: 'noopener', onclick: () => markRead() }, label);
 
   mount(wrap,
     h('div', { class: 'reader-kicker' }, meta),
     titleEl,
-    article.lang !== 'ru' && article.title_ru && article.title_ru !== article.title ? h('div', { class: 'reader-subtitle' }, article.title_ru) : null,
+    isForeign && article.title_ru && article.title_ru !== article.title ? h('div', { class: 'reader-subtitle' }, article.title_ru) : null,
     article.summary ? h('div', { class: 'reader-summary no-translate' }, h('b', {}, 'О чём статья. '), article.summary) : null,
     h('div', { class: 'reader-tools' },
-      h('a', { class: 'btn', href: article.url, target: '_blank', rel: 'noopener' }, '↗ Оригинал'),
+      original('↗ Оригинал'),
       h('button', { class: 'btn accent', onclick: () => openChat(article) }, '✨ Обсудить с Claude')),
-    article.lang !== 'ru' && !store.ls.get('hint.tap', false)
-      ? h('div', { class: 'reader-hint no-translate', onclick: (e) => { store.ls.set('hint.tap', true); e.currentTarget.remove(); } },
-        'Коснитесь английского слова — появится перевод. Выделите фразу — переведётся целиком. «A/Я» вверху выключает перевод. ✕')
+    isForeign && !store.ls.get('hint.tap2', false)
+      ? h('div', { class: 'reader-hint no-translate', onclick: (e) => { store.ls.set('hint.tap2', true); e.currentTarget.remove(); } },
+        'Коснитесь английского слова — перевод, «★ В словарь» и «¶ Абзац». Выделите фразу — переведётся целиком. «⇄» вверху показывает перевод под каждым абзацем. ✕')
       : null,
     content,
   );
-  layer.body.append(wrap, h('button', { class: 'fab', 'aria-label': 'Спросить Claude', onclick: () => openChat(article) }, '✨'));
-  const detach = attachTranslator(wrap);
+  body.append(wrap, h('button', { class: 'fab', 'aria-label': 'Спросить Claude', onclick: () => openChat(article) }, '✨'));
+  const detach = attachTranslator(wrap, { article });
+
+  // ---- место в статье и отметка «прочитано» ----
+  const endEl = h('div', { class: 'reader-end no-translate' });
+  // Абзацы текста (без блоков перевода и концовки) — по ним запоминаем место.
+  const blocks = () => [...content.children].filter((el) => el !== endEl && !el.classList.contains('para-tr'));
+
+  function markRead() {
+    if (store.isRead(article.id)) return;
+    store.markRead(article.id);
+    drawEnd();
+  }
+  function drawEnd() {
+    const read = store.isRead(article.id);
+    mount(endEl,
+      h('p', {}, 'Текст извлечён автоматически — возможны неточности оформления.'),
+      h('div', { class: 'row wrap' },
+        read
+          ? h('button', { class: 'btn', onclick: () => { store.markRead(article.id, false); drawEnd(); } }, '✓ Прочитано')
+          : h('button', { class: 'btn accent', onclick: markRead }, 'Отметить прочитанным'),
+        original('Открыть оригинал', 'btn ghost')));
+  }
+
+  function saveProgress() {
+    if (!loaded) return;
+    const list = blocks();
+    if (!list.length) return;
+    const max = body.scrollHeight - body.clientHeight;
+    const top = body.getBoundingClientRect().top + 70; // под шапкой
+    let para = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].getBoundingClientRect().bottom > top) { para = i; break; }
+    }
+    const p = max > 0 ? body.scrollTop / max : 1;
+    store.setProgress(article.id, { p, para });
+    // Дочитали до конца (и провели в статье хотя бы 15 секунд) — прочитано.
+    const endVisible = endEl.getBoundingClientRect().top < body.getBoundingClientRect().bottom;
+    if (endVisible && Date.now() - openedAt > 15000) markRead();
+  }
+  let scrollTimer = 0;
+  body.addEventListener('scroll', () => {
+    if (scrollTimer) return;
+    scrollTimer = setTimeout(() => { scrollTimer = 0; saveProgress(); }, 400);
+  }, { passive: true });
+  const readTimer = setTimeout(saveProgress, 16000); // для коротких статей, которые не нужно листать
+
+  function restorePosition() {
+    const pr = store.getProgress(article.id);
+    if (!pr || pr.para < 2 || store.isRead(article.id)) return;
+    const target = blocks()[pr.para];
+    if (!target) return;
+    body.scrollTop += target.getBoundingClientRect().top - body.getBoundingClientRect().top - 70;
+    toast('Продолжаем с места, где вы остановились', { action: 'С начала', onAction: () => { body.scrollTop = 0; }, timeout: 4000 });
+  }
 
   const load = async (force = false) => {
     content.replaceChildren(skeleton());
@@ -186,22 +290,24 @@ export function openReader(article) {
       content.innerHTML = renderMarkdown(md, { base: article.url });
       // Битые картинки убираем, чтобы не оставались пустые рамки с подписью.
       for (const img of content.querySelectorAll('img')) img.addEventListener('error', () => img.remove(), { once: true });
-      content.append(h('div', { class: 'reader-end no-translate' },
-        h('p', {}, 'Текст извлечён автоматически — возможны неточности оформления.'),
-        h('a', { class: 'btn', href: article.url, target: '_blank', rel: 'noopener' }, 'Открыть оригинал')));
+      drawEnd();
+      content.append(endEl);
+      loaded = true;
+      restorePosition();
+      if (isForeign && store.settings.parallel) stopParallel = startParallel(content);
     } catch (err) {
       const retell = () => openChat(article, { prompt: 'Перескажи подробно, о чём эта статья: основные идеи, факты и выводы.' });
       content.replaceChildren(err.protected
         ? h('div', { class: 'reader-error no-translate' },
           h('p', {}, h('b', {}, `${article.source} не даёт загрузить текст в приложение`), ' — сайт защищён от автоматического чтения. Откройте статью в Safari или попросите Claude её пересказать.'),
           h('div', { class: 'row' },
-            h('a', { class: 'btn accent', href: article.url, target: '_blank', rel: 'noopener' }, '↗ Открыть в Safari'),
+            original('↗ Открыть в Safari', 'btn accent'),
             h('button', { class: 'btn', onclick: retell }, '✨ Пересказ от Claude'),
             h('button', { class: 'btn ghost', onclick: () => load(true) }, 'Попробовать ещё раз')))
         : h('div', { class: 'reader-error no-translate' },
           h('p', {}, 'Не получилось загрузить текст статьи: ' + (err.message || err) + '.'),
           h('div', { class: 'row' },
-            h('a', { class: 'btn', href: article.url, target: '_blank', rel: 'noopener' }, '↗ Открыть в Safari'),
+            original('↗ Открыть в Safari'),
             h('button', { class: 'btn', onclick: () => load(true) }, 'Повторить'),
             h('button', { class: 'btn accent', onclick: retell }, '✨ Пересказ от Claude'))));
     }

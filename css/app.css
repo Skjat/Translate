@@ -329,7 +329,7 @@ details[open] summary { margin-bottom: 8px; }
 .tr-pos { color: var(--text-3); font-style: italic; }
 .tr-note { font-size: 14px; margin-top: 6px; padding: 8px 10px; border-radius: 10px; background: var(--accent-soft); }
 .tr-engine { font-size: 11px; color: var(--text-3); margin-top: 6px; text-align: right; }
-.tr-actions { display: flex; gap: 8px; margin-top: 8px; }
+.tr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 
 /* ---------- чат ---------- */
 .chat .layer-body { display: flex; flex-direction: column; padding-bottom: 0; }
@@ -393,6 +393,9 @@ details[open] summary { margin-bottom: 8px; }
   opacity: 0; transform: translateY(10px); transition: opacity 0.2s, transform 0.2s;
 }
 #toast.show { opacity: 1; transform: none; }
+/* Внутри статьи или чата уведомление — сверху, чтобы не закрывать карточку перевода и поле ввода. */
+body.has-layer #toast { top: calc(var(--safe-top) + 64px); bottom: auto; transform: translateY(-10px); }
+body.has-layer #toast.show { transform: none; }
 .toast-inner {
   display: flex; align-items: center; gap: 12px; max-width: 520px;
   padding: 11px 14px; border-radius: 14px;
@@ -409,3 +412,49 @@ details[open] summary { margin-bottom: 8px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* ---------- прогресс чтения, офлайн ---------- */
+.card { position: relative; overflow: hidden; }
+.card-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--surface-2); }
+.card-progress span { display: block; height: 100%; background: var(--accent); border-radius: 0 2px 2px 0; }
+.badge.offline { background: var(--accent-soft); color: var(--accent); text-transform: none; }
+.section-title { font-weight: 700; font-size: 15px; padding: 4px 16px 8px; }
+.continue { margin-bottom: 14px; }
+.continue .card-title { font-size: 16px; }
+.saved-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.segmented.wide button { font-size: 13px; padding: 6px 6px; }
+.tabbar button { position: relative; }
+.tab-badge {
+  position: absolute; top: 5px; left: calc(50% + 6px);
+  min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px;
+  background: var(--new); color: #fff; font-size: 11px; font-weight: 700; line-height: 17px; text-align: center;
+}
+
+/* ---------- перевод абзацев ---------- */
+.para-tr {
+  font-family: var(--sans); font-size: 0.86em; line-height: 1.5; color: var(--text-2);
+  margin: -0.4em 0 1.1em; padding: 8px 12px; border-left: 3px solid var(--accent);
+  background: var(--accent-soft); border-radius: 0 10px 10px 0; cursor: pointer;
+}
+li .para-tr { margin: 6px 0 4px; }
+.para-tr.error { border-left-color: var(--danger); color: var(--danger); }
+
+/* ---------- словарь и повторение ---------- */
+.vocab-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0 6px; }
+.vocab-item { background: var(--surface); border-radius: 14px; padding: 10px 12px 12px; box-shadow: var(--shadow); }
+.vocab-row { display: flex; align-items: center; gap: 4px; }
+.vocab-word { font-weight: 700; font-size: 18px; }
+.vocab-box { color: var(--accent); font-size: 10px; letter-spacing: 2px; margin-right: 4px; }
+.vocab-tr { font-size: 16px; margin: 2px 0 6px; }
+.vocab-note { margin-bottom: 6px; }
+.vocab-ctx { font-family: var(--serif); font-size: 15px; color: var(--text-2); line-height: 1.45; }
+.vocab-ctx mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 2px; }
+.vocab-src { display: block; margin-top: 8px; border: 0; background: none; padding: 0; text-align: left; color: var(--accent); font-size: 13px; }
+.review-card { display: flex; flex-direction: column; gap: 14px; padding: 8px 4px 12px; }
+.review-card.center { align-items: center; text-align: center; }
+.review-word { font-size: 30px; font-weight: 750; display: flex; align-items: center; gap: 6px; }
+.review-answer { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
+.review-tr { font-size: 22px; font-weight: 600; }
+.review-buttons { margin-top: 10px; }
+.review-buttons .btn { flex: 1; }
+.review .btn.wide { width: 100%; margin: 0; }
