@@ -86,7 +86,12 @@ export function openLayer({ kind = 'sheet', title = '', className = '', actions 
     closed = true;
     const i = stack.indexOf(entry);
     if (i >= 0) stack.splice(i, 1);
-    if (!fromHistory) history.back();
+    // Закрытие кнопкой: убираем свою запись истории, но popstate от этого back()
+    // не должен закрыть слой под нами.
+    if (!fromHistory) {
+      ignorePops++;
+      history.back();
+    }
     wrap.classList.remove('open');
     wrap.classList.add('closing');
     setTimeout(() => wrap.remove(), 280);
@@ -96,7 +101,12 @@ export function openLayer({ kind = 'sheet', title = '', className = '', actions 
   return { el: panel, head, body, titleEl, actionsEl, close: () => close(false) };
 }
 
+let ignorePops = 0;
 window.addEventListener('popstate', () => {
+  if (ignorePops > 0) {
+    ignorePops--;
+    return;
+  }
   const top = stack[stack.length - 1];
   if (top) top.close();
 });

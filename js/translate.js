@@ -90,18 +90,25 @@ export async function viaClaude(text, context = '') {
   return { translation: d.translation, dict, note: d.explanation || '', engine: 'Claude', pos: d.part_of_speech || '' };
 }
 
+/** Ключ кэша: перевод Claude зависит от контекста, словарные сервисы — только от текста. */
+const cacheKey = (engine, text, context) => (engine === 'claude' ? `claude|${context}|${text}` : `${engine}|${text}`);
+
 async function translate(text, context, { forceClaude = false } = {}) {
   const engine = forceClaude ? 'claude' : settings.translateEngine;
-  const key = `${engine}|${forceClaude ? context + '|' : ''}${text}`;
-  if (cache.has(key)) return cache.get(key);
   const order = engine === 'claude' ? ['claude', 'google', 'mymemory'] : engine === 'mymemory' ? ['mymemory', 'google'] : ['google', 'mymemory'];
   if (forceClaude) order.splice(1);
+  for (const e of order) {
+    const hit = cache.get(cacheKey(e, text, context));
+    if (hit) return hit;
+  }
   let lastErr;
   for (const e of order) {
     if (e === 'claude' && !hasKey()) { lastErr = new Error('Для перевода через Claude нужен API-ключ'); continue; }
     try {
       const result = e === 'claude' ? await viaClaude(text, context) : e === 'mymemory' ? await viaMyMemory(text) : await viaGoogle(text);
-      cache.set(key, result);
+      // Кладём под ключ того сервиса, который реально ответил.
+      cache.set(cacheKey(e, text, context), result);
+      if (cache.size > 600) cache.delete(cache.keys().next().value);
       saveCache();
       return result;
     } catch (err) {
@@ -110,6 +117,12 @@ async function translate(text, context, { forceClaude = false } = {}) {
     }
   }
   throw lastErr || new Error('Перевод недоступен');
+}
+
+/** Очистка кэша переводов (и в памяти, и на устройстве). */
+export function clearTranslationCache() {
+  cache.clear();
+  ls.del('tcache');
 }
 
 // ---------- карточка перевода ----------
@@ -128,6 +141,7 @@ function ensureCard() {
 }
 
 export function hideTranslation() {
+  requestSeq++; // запоздавший ответ не должен снова показать закрытую карточку
   card?.classList.remove('show');
   mark?.classList.remove('show');
   current = null;

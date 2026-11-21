@@ -36,8 +36,9 @@ export function cleanReaderText(raw) {
     // Пометки для скринридеров в текстах ссылок.
     .replace(/\s*\((opens|open) (in )?a new (tab|window)\)/gi, '')
     .replace(/\s*\(откроется в новой вкладке\)/gi, '')
-    // Буквица, оторванная от слова: «C old fusion» → «Cold fusion» (только в начале абзаца, кроме «A» и «I»).
-    .replace(/(^|\n)([B-HJ-Z]) ([a-z]{2,})/g, '$1$2$3')
+    // Буквица, оторванная от слова: «C old fusion» → «Cold fusion». Только в первом абзаце текста
+    // («T cells», «X rays» в середине статьи — настоящие слова).
+    .replace(/^(?:[ \t]*(?:!\[[^\n]*|#[^\n]*)?\n)*[ \t]*([B-HJ-Z]) ([a-z]{2,})/, (m, letter, rest) => m.replace(`${letter} ${rest}`, letter + rest))
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

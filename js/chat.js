@@ -61,24 +61,45 @@ function chatKey(article) {
   return 'chat:' + (article ? article.id : 'general');
 }
 
+const snapshot = (a) => (a ? { id: a.id, title: a.title, title_ru: a.title_ru, url: a.url, source: a.source, lang: a.lang, topic: a.topic, tags: a.tags, summary: a.summary, published: a.published, reading_minutes: a.reading_minutes, kind: a.kind } : null);
+
 function newConversation(article) {
-  return { v: 1, articleId: article?.id || null, title: article ? article.title_ru || article.title : 'Свободный разговор', messages: [], ui: {}, updated: Date.now() };
+  return { v: 1, articleId: article?.id || null, article: snapshot(article), title: article ? article.title_ru || article.title : 'Свободный разговор', messages: [], ui: {}, updated: Date.now() };
 }
 
-/** Если приложение закрыли посреди вызова инструмента — закрываем его ошибкой, чтобы история оставалась корректной. */
+/**
+ * Чинит историю, чтобы API её принял: убирает пустые ответы ассистента и закрывает вызовы
+ * инструментов без результата (приложение закрыли посреди поиска, ответ оборвался и т. п.).
+ * Возвращает true, если что-то изменилось.
+ */
 function repair(conv) {
-  const last = conv.messages[conv.messages.length - 1];
-  if (last?.role === 'assistant' && Array.isArray(last.content)) {
-    const calls = last.content.filter((b) => b.type === 'tool_use');
-    if (calls.length) {
-      conv.messages.push({
-        role: 'user',
-        content: calls.map((c) => ({ type: 'tool_result', tool_use_id: c.id, is_error: true, content: 'Выполнение прервано: приложение было закрыто.' })),
-      });
+  let changed = false;
+  const out = [];
+  const msgs = conv.messages;
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.role === 'assistant' && Array.isArray(m.content) && !m.content.some((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking')) {
+      changed = true; // пустой ответ (например, отказ) — API такой не примет
+      continue;
+    }
+    out.push(m);
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    const ids = m.content.filter((b) => b.type === 'tool_use').map((b) => b.id);
+    if (!ids.length) continue;
+    const next = msgs[i + 1];
+    const answered = new Set(next?.role === 'user' && Array.isArray(next.content)
+      ? next.content.filter((b) => b.type === 'tool_result').map((b) => b.tool_use_id) : []);
+    const missing = ids.filter((id) => !answered.has(id));
+    if (missing.length) {
+      changed = true;
+      out.push({ role: 'user', content: missing.map((id) => ({ type: 'tool_result', tool_use_id: id, is_error: true, content: 'Выполнение прервано.' })) });
     }
   }
-  return conv;
+  conv.messages = out;
+  return changed;
 }
+
+const openKeys = new Set(); // одна и та же переписка не открывается дважды
 
 async function contextBlock(article) {
   const t = topicById(article.topic);
@@ -159,10 +180,16 @@ function addPart(bubble, b) {
 // ---------- открытие окна ----------
 export async function openChat(article = null, { prompt = '' } = {}) {
   const key = chatKey(article);
-  let conv = repair((await kv.get(key)) || newConversation(article));
+  if (openKeys.has(key)) return null;
+  openKeys.add(key);
+  let conv = (await kv.get(key)) || newConversation(article);
+  if (article && !conv.article) conv.article = snapshot(article);
+  const repaired = repair(conv);
   let busy = false;
+  let closed = false;
+  let myFind = false; // этот чат сейчас ищет статьи
   let controller = null;
-  let live = null; // { messages: [...finished this turn], snapshot }
+  let live = null; // { snapshot, error }
 
   const resetBtn = h('button', { class: 'chip', onclick: async () => {
     if (busy) return;
@@ -177,22 +204,29 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     title: article ? '✨ ' + (article.title_ru || article.title) : '✨ Спросить Claude',
     className: 'chat',
     actions: [resetBtn],
-    onClose: () => controller?.abort(),
+    onClose: () => {
+      closed = true;
+      openKeys.delete(key);
+      controller?.abort();
+      if (myFind) cancelDiscovery();
+    },
   });
 
   const list = h('div', { class: 'chat-list' });
+  const tail = h('div', { class: 'chat-tail' });
   const empty = h('div', { class: 'chat-empty' });
   const input = h('textarea', { class: 'chat-input', rows: 1, placeholder: article ? 'Спросите о статье или теме…' : 'Спросите о чём угодно или попросите статьи…', enterkeyhint: 'send' });
   const sendBtn = h('button', { class: 'send-btn', 'aria-label': 'Отправить' }, '↑');
   const footer = h('div', { class: 'chat-footer' },
     h('div', { class: 'chat-model muted' }, modelInfo(store.settings.model).label + (store.settings.chatWebSearch ? ' · веб-поиск' : '')),
     h('div', { class: 'chat-compose' }, input, sendBtn));
-  layer.body.append(list, empty, footer);
+  layer.body.append(list, tail, empty, footer);
   attachTranslator(list);
 
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !matchMedia('(pointer: coarse)').matches) {
+    // Клавиша «Отправить» на клавиатуре iPhone отправляет; Shift+Enter — перенос строки.
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       submit();
     }
@@ -205,6 +239,8 @@ export async function openChat(article = null, { prompt = '' } = {}) {
   }
 
   function save() {
+    // После закрытия окна не пишем: переписку могли уже открыть заново.
+    if (closed) return Promise.resolve();
     conv.updated = Date.now();
     return kv.set(key, conv);
   }
@@ -219,7 +255,7 @@ export async function openChat(article = null, { prompt = '' } = {}) {
 
   function stop() {
     controller?.abort();
-    cancelDiscovery();
+    if (myFind) cancelDiscovery(); // чужой поиск (автообновление, окно ↻) не трогаем
   }
 
   async function send(text) {
@@ -231,6 +267,7 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     if (article && conv.messages.length === 0) content.push({ type: 'text', text: await contextBlock(article) });
     content.push({ type: 'text', text });
     conv.messages.push({ role: 'user', content });
+    stick = true;
     await save();
     await runTurn();
   }
@@ -261,7 +298,14 @@ export async function openChat(article = null, { prompt = '' } = {}) {
         }, { signal: controller.signal });
         if (request.messages !== conv.messages) conv.messages = [...request.messages]; // история очищена от устаревших рассуждений
         live.snapshot = null;
-        conv.messages.push({ role: 'assistant', content: message.content });
+        // В историю — только то, что API примет обратно: при любой остановке, кроме tool_use и
+        // pause_turn, незавершённые вызовы инструментов отбрасываем; пустой ответ (отказ) не храним.
+        let content = message.content;
+        if (message.stop_reason !== 'tool_use' && message.stop_reason !== 'pause_turn') content = content.filter((b) => b.type !== 'tool_use');
+        if (message.stop_reason === 'refusal') content = content.filter((b) => b.type === 'text' && b.text);
+        if (content.some((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking')) {
+          conv.messages.push({ role: 'assistant', content });
+        }
         await save();
 
         if (message.stop_reason === 'pause_turn') continue; // сервер продолжит поиск с того же места
@@ -310,6 +354,7 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     if (isRunning()) return fail('Сейчас уже идёт другой поиск статей. Предложи пользователю повторить чуть позже.');
 
     const ui = (conv.ui[call.id] = { query, status: 'running', log: [] });
+    myFind = true;
     render();
     try {
       const r = await runDiscovery({
@@ -332,6 +377,8 @@ export async function openChat(article = null, { prompt = '' } = {}) {
       conv.ui[call.id] = { query, status: 'error', error: aborted ? 'Поиск остановлен' : describeError(err) };
       await save();
       return fail(aborted ? 'Пользователь остановил поиск.' : 'Поиск не удался: ' + describeError(err));
+    } finally {
+      myFind = false;
     }
   }
 
@@ -341,20 +388,39 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); });
   }
 
+  let rendered = []; // [{ sig, el }] — уже нарисованные пузыри
+  let stick = true; // прокручивать вниз при новых сообщениях
+
+  /** Подпись пузыря: если не изменилась, DOM не трогаем (сохраняются выделение и раскрытые блоки). */
+  function bubbleSig(b) {
+    if (b.role === 'user') return 'u' + b.text.length + b.text.slice(0, 40);
+    return 'a' + b.parts.map((p) => p.kind + (p.text?.length ?? '') + (p.kind === 'find' ? JSON.stringify(conv.ui[p.id] || {}).length : '')).join(',') + ':' + b.sources.size;
+  }
+
   function render(error = null) {
-    const nearBottom = layer.body.scrollHeight - layer.body.scrollTop - layer.body.clientHeight < 120;
+    const body = layer.body;
+    const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 120;
     const messages = live?.snapshot ? [...conv.messages, { role: 'assistant', content: live.snapshot.content || [] }] : conv.messages;
     const bubbles = toBubbles(messages);
-    list.replaceChildren(...bubbles.map(renderBubble));
+    let same = 0;
+    while (same < bubbles.length && same < rendered.length && rendered[same].sig === bubbleSig(bubbles[same])) same++;
+    for (const r of rendered.slice(same)) r.el.remove();
+    rendered = rendered.slice(0, same);
+    for (const b of bubbles.slice(same)) {
+      const el = renderBubble(b);
+      list.append(el);
+      rendered.push({ sig: bubbleSig(b), el });
+    }
 
+    tail.replaceChildren();
     if (busy && !live?.snapshot && !(bubbles[bubbles.length - 1]?.role === 'assistant' && Object.values(conv.ui).some((u) => u.status === 'running'))) {
-      list.append(h('div', { class: 'bubble assistant typing' }, h('span'), h('span'), h('span')));
+      tail.append(h('div', { class: 'bubble assistant typing' }, h('span'), h('span'), h('span')));
     } else if (busy && live?.snapshot && !(live.snapshot.content || []).some((b) => b.type === 'text' && b.text)) {
-      list.append(h('div', { class: 'typing-inline muted' }, 'Claude думает…'));
+      tail.append(h('div', { class: 'typing-inline muted' }, 'Claude думает…'));
     }
     const err = error || live?.error;
     if (err) {
-      list.append(h('div', { class: 'bubble error' }, err, ' ',
+      tail.append(h('div', { class: 'bubble error' }, err, ' ',
         h('button', { class: 'chip', onclick: () => runTurn() }, 'Повторить')));
     }
 
@@ -370,13 +436,16 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     sendBtn.textContent = busy ? '■' : '↑';
     sendBtn.classList.toggle('stop', busy);
     sendBtn.setAttribute('aria-label', busy ? 'Остановить' : 'Отправить');
-    if (nearBottom || busy) layer.body.scrollTop = layer.body.scrollHeight;
+    // Прокручиваем вниз, только если читатель и так внизу (или только что отправил сообщение):
+    // во время долгого поиска можно спокойно листать вверх.
+    if (nearBottom || stick) body.scrollTop = body.scrollHeight;
+    stick = false;
   }
 
   function renderBubble(b) {
     if (b.role === 'user') {
       return h('div', { class: 'bubble user' },
-        b.withContext ? h('div', { class: 'ctx-chip' }, '📎 ', article ? article.source : 'статья') : null,
+        b.withContext ? h('div', { class: 'ctx-chip' }, '📎 ', article ? article.source : conv.article?.source || 'статья') : null,
         b.text);
     }
     const el = h('div', { class: 'bubble assistant' });
@@ -388,7 +457,9 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     for (const p of b.parts) {
       if (p.kind === 'activity') { activities.push(p); continue; }
       flushActivities();
-      if (p.kind === 'text') el.append(h('div', { class: 'md', html: renderMarkdown(p.text) }));
+      // Картинки в ответах показываем ссылками: страница, прочитанная через веб-поиск, могла
+      // подсунуть Claude картинку-«маячок», которая при загрузке унесла бы текст разговора.
+      if (p.kind === 'text') el.append(h('div', { class: 'md', html: renderMarkdown(p.text, { images: false }) }));
       else if (p.kind === 'note') el.append(h('div', { class: 'note muted' }, p.text));
       else if (p.kind === 'find') el.append(renderFind(p));
     }
@@ -422,6 +493,7 @@ export async function openChat(article = null, { prompt = '' } = {}) {
     return box;
   }
 
+  if (repaired) save();
   render();
   if (prompt && !conv.messages.length) submit(prompt);
   else if (prompt) { input.value = prompt; autosize(); }

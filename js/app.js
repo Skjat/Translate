@@ -9,6 +9,7 @@ import { pickStaleTopics } from './discover-core.js';
 import { MODELS, describeError, modelInfo } from './claude-core.js';
 import { hasKey, testKey } from './claude.js';
 import { kv } from './db.js';
+import { clearTranslationCache } from './translate.js';
 
 const view = $('#view');
 const ui = {
@@ -125,19 +126,61 @@ function staleBanner() {
     h('button', { class: 'chip', onclick: () => switchTab('settings') }, 'Настройки'));
 }
 
-function renderFeed() {
-  const items = filtered();
-  const updated = lastUpdate();
-  const search = h('input', { class: 'search', type: 'search', placeholder: 'Поиск по статьям и тегам', value: ui.q, enterkeyhint: 'search' });
-  search.addEventListener('input', debounce(() => { ui.q = search.value; ui.limit = 30; renderList(); }, 200));
+let feedRefs = null; // элементы ленты, которые обновляются без пересоздания поля поиска
 
-  const topics = h('div', { class: 'chips scroll' },
+function topicChips() {
+  return h('div', { class: 'chips scroll' },
     h('button', { class: 'chip' + (ui.topic === 'all' && !ui.queriesOnly ? ' active' : ''), onclick: () => setFilter({}) }, 'Все'),
     store.library().some((a) => a.query) ? h('button', { class: 'chip' + (ui.queriesOnly ? ' active' : ''), onclick: () => setFilter({ queriesOnly: !ui.queriesOnly }) }, '🔎 Мои запросы') : null,
     TOPICS.map((t) => h('button', {
       class: 'chip' + (ui.topic === t.id ? ' active' : ''),
       onclick: () => setFilter({ topic: ui.topic === t.id ? 'all' : t.id }),
     }, `${t.emoji} ${t.short}`)));
+}
+
+function renderList() {
+  if (!feedRefs) return;
+  const { listEl } = feedRefs;
+  const current = filtered();
+  listEl.replaceChildren();
+  if (ui.tag) listEl.append(h('div', { class: 'active-filter' }, `#${ui.tag}`, h('button', { class: 'chip', onclick: () => setFilter({}) }, '✕ Сбросить')));
+  if (!current.length) {
+    listEl.append(h('div', { class: 'empty' },
+      h('p', {}, ui.q ? `По запросу «${ui.q}» ничего нет.` : 'Здесь пока пусто.'),
+      h('button', { class: 'btn accent', onclick: () => openChat(null, { prompt: ui.q ? `Хочу статьи про ${ui.q}` : '' }) }, ui.q ? `✨ Найти статьи про «${ui.q}»` : '✨ Попросить Claude подобрать статьи')));
+    return;
+  }
+  current.slice(0, ui.limit).forEach((a) => listEl.append(articleCard(a)));
+  if (current.length > ui.limit) {
+    listEl.append(h('button', { class: 'btn wide', onclick: () => { ui.limit += 30; renderList(); } }, `Показать ещё (${current.length - ui.limit})`));
+  }
+  if (ui.q) listEl.append(h('button', { class: 'btn wide accent', onclick: () => openChat(null, { prompt: `Хочу больше статей про ${ui.q}` }) }, `✨ Найти ещё статьи про «${ui.q}»`));
+}
+const renderListSoon = debounce(renderList, 200);
+
+/** Обновляет счётчик, баннеры, темы и список, не трогая поле поиска (клавиатура не закрывается). */
+function updateFeed() {
+  if (!feedRefs || !view.contains(feedRefs.listEl)) { renderFeed(); return; }
+  const { headInfo, bannerSlot, topicsSlot } = feedRefs;
+  const updated = lastUpdate();
+  const total = filtered().length;
+  headInfo.textContent = `${total} ${plural(total, 'статья', 'статьи', 'статей')} · лента обновлена ${updated ? timeAgo(updated) : '—'}`;
+  mount(bannerSlot, discoverBanner(), staleBanner());
+  const hasQueries = store.library().some((a) => a.query);
+  if (hasQueries !== feedRefs.hasQueries) {
+    feedRefs.hasQueries = hasQueries;
+    mount(topicsSlot, topicChips());
+  }
+  renderList();
+}
+
+function renderFeed() {
+  const search = h('input', { class: 'search', type: 'search', placeholder: 'Поиск по статьям и тегам', value: ui.q, enterkeyhint: 'search' });
+  search.addEventListener('input', () => {
+    ui.q = search.value; // состояние — сразу, список — с задержкой
+    ui.limit = 30;
+    renderListSoon();
+  });
 
   const seg = (value, label) => h('button', { class: ui.lang === value ? 'active' : '', onclick: () => { ui.lang = value; renderFeed(); } }, label);
   const filters = h('div', { class: 'filter-row' },
@@ -146,40 +189,25 @@ function renderFeed() {
       h('input', { type: 'checkbox', checked: ui.unread, onchange: (e) => { ui.unread = e.target.checked; renderFeed(); } }),
       'Непрочитанные'));
 
+  const headInfo = h('div', { class: 'muted small' });
+  const bannerSlot = h('div');
+  const topicsSlot = h('div', {}, topicChips());
   const listEl = h('div', { class: 'list' });
-  function renderList() {
-    const current = filtered();
-    listEl.replaceChildren();
-    if (ui.tag) listEl.append(h('div', { class: 'active-filter' }, `#${ui.tag}`, h('button', { class: 'chip', onclick: () => setFilter({}) }, '✕ Сбросить')));
-    if (!current.length) {
-      listEl.append(h('div', { class: 'empty' },
-        h('p', {}, ui.q ? `По запросу «${ui.q}» ничего нет.` : 'Здесь пока пусто.'),
-        h('button', { class: 'btn accent', onclick: () => openChat(null, { prompt: ui.q ? `Хочу статьи про ${ui.q}` : '' }) }, ui.q ? `✨ Найти статьи про «${ui.q}»` : '✨ Попросить Claude подобрать статьи')));
-      return;
-    }
-    current.slice(0, ui.limit).forEach((a) => listEl.append(articleCard(a)));
-    if (current.length > ui.limit) {
-      listEl.append(h('button', { class: 'btn wide', onclick: () => { ui.limit += 30; renderList(); } }, `Показать ещё (${current.length - ui.limit})`));
-    }
-    if (ui.q) listEl.append(h('button', { class: 'btn wide accent', onclick: () => openChat(null, { prompt: `Хочу больше статей про ${ui.q}` }) }, `✨ Найти ещё статьи про «${ui.q}»`));
-  }
+  feedRefs = { headInfo, bannerSlot, topicsSlot, listEl, hasQueries: store.library().some((a) => a.query) };
 
   mount(view,
     h('header', { class: 'page-head' },
-      h('div', {},
-        h('h1', {}, 'Лента'),
-        h('div', { class: 'muted small' }, `${items.length} ${plural(items.length, 'статья', 'статьи', 'статей')} · лента обновлена ${updated ? timeAgo(updated) : '—'}`)),
+      h('div', {}, h('h1', {}, 'Лента'), headInfo),
       h('div', { class: 'head-actions' },
         h('button', { class: 'icon-btn', 'aria-label': 'Спросить Claude', onclick: () => openChat(null) }, '✨'),
         h('button', { class: 'icon-btn', 'aria-label': 'Обновить ленту', onclick: openRefreshSheet }, '↻'))),
-    discoverBanner(),
-    staleBanner(),
+    bannerSlot,
     search,
-    topics,
+    topicsSlot,
     filters,
     listEl,
   );
-  renderList();
+  updateFeed();
 }
 
 // ---------- Обновление ленты ----------
@@ -337,7 +365,8 @@ async function renderSaved() {
     const chats = await listChats();
     if (!chats.length) list.append(h('div', { class: 'empty' }, 'Разговоров с Claude пока нет.'));
     for (const { key, conv } of chats) {
-      const article = conv.articleId ? store.getArticle(conv.articleId) : null;
+      // Статья могла выпасть из ленты — тогда берём её снимок, сохранённый в переписке.
+      const article = conv.articleId ? store.getArticle(conv.articleId) || conv.article || null : null;
       list.append(h('button', { class: 'chat-row', onclick: () => openChat(article) },
         h('div', { class: 'mini-title' }, (article ? '📄 ' : '💬 ') + conv.title),
         h('div', { class: 'muted small' }, `${conv.messages.filter((m) => m.role === 'user' && !(Array.isArray(m.content) && m.content.every((b) => b.type === 'tool_result'))).length} вопр. · ${timeAgo(conv.updated)}`),
@@ -418,7 +447,7 @@ function renderSettings() {
     h('section', { class: 'group' },
       h('h3', {}, 'Данные'),
       h('div', { class: 'row wrap' },
-        h('button', { class: 'btn', onclick: async () => { await kv.clear('reader:'); store.ls.del('tcache'); toast('Кэш текстов и переводов очищен'); } }, 'Очистить кэш'),
+        h('button', { class: 'btn', onclick: async () => { await kv.clear('reader:'); clearTranslationCache(); store.ls.del('protectedHosts'); toast('Кэш текстов и переводов очищен'); } }, 'Очистить кэш'),
         h('button', { class: 'btn danger', onclick: async () => {
           if (!confirm('Удалить все данные приложения на этом устройстве, включая API-ключ, избранное и чаты?')) return;
           store.resetAll();
@@ -440,7 +469,8 @@ function switchTab(tab) {
 
 function rerender() {
   if (ui.tab === 'settings') return; // не сбрасываем поля ввода
-  RENDER[ui.tab]();
+  if (ui.tab === 'feed') updateFeed();
+  else RENDER[ui.tab]();
 }
 
 document.querySelector('.tabbar').addEventListener('click', (e) => {
@@ -455,7 +485,7 @@ store.on('library', debounce(rerender, 50));
 store.on('saved', () => { if (ui.tab === 'saved') renderSaved(); });
 store.on('discover-state', (st) => {
   if (!st.running) ui.discoverLog = [];
-  if (ui.tab === 'feed') renderFeed();
+  if (ui.tab === 'feed') updateFeed();
 });
 store.on('discover-event', (ev) => {
   const text = ev.type === 'search' ? '🔎 ' + ev.query : ev.type === 'fetch' ? '📄 ' + ev.url : ev.type === 'status' ? ev.text : null;
@@ -475,6 +505,8 @@ function installHint() {
 
 async function boot() {
   store.init();
+  // Просим не вытеснять данные (ключ, избранное, чаты) при нехватке места.
+  navigator.storage?.persist?.().catch(() => {});
   switchTab('feed');
   const hadFeed = !!store.meta().fetchedAt;
   const n = await refreshRemote();
@@ -492,15 +524,29 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').then((reg) => {
-    reg?.addEventListener('updatefound', () => {
-      const sw = reg.installing;
-      sw?.addEventListener('statechange', () => {
-        if (sw.state === 'installed' && navigator.serviceWorker.controller) {
-          toast('Доступна новая версия приложения', { action: 'Обновить', onAction: () => location.reload(), timeout: 0 });
-        }
-      });
+  const offerUpdate = (reg) => {
+    if (!reg.waiting || !navigator.serviceWorker.controller) return;
+    toast('Доступна новая версия приложения', {
+      action: 'Обновить',
+      timeout: 0,
+      onAction: () => reg.waiting?.postMessage('skipWaiting'), // перезагрузка — по controllerchange
     });
+  };
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloading) return;
+    reloading = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    if (!reg) return;
+    offerUpdate(reg); // новая версия могла скачаться в прошлый раз и ждать
+    reg.addEventListener('updatefound', () => {
+      const sw = reg.installing;
+      sw?.addEventListener('statechange', () => { if (sw.state === 'installed') offerUpdate(reg); });
+    });
+    // iOS подолгу держит PWA в памяти — проверяем обновление при возвращении в приложение.
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
   }).catch((err) => console.warn('Service worker:', err));
 }
 

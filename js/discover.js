@@ -2,7 +2,7 @@
 import { discoverArticles, pickStaleTopics } from './discover-core.js';
 import { getClient, hasKey } from './claude.js';
 import * as store from './store.js';
-import { estimateCost, describeError } from './claude-core.js';
+import { estimateCost, describeError, isAbortError } from './claude-core.js';
 
 let running = null; // { controller, promise, label }
 
@@ -88,6 +88,10 @@ export async function maybeAutoDiscover() {
   try {
     return await runDiscovery({ count: Math.min(8, s.discoverCount) });
   } catch (err) {
+    if (isAbortError(err)) { // пользователь сам нажал «Стоп» — не ошибка, но и сразу не повторяем
+      store.setMeta({ lastAttemptAt: Date.now() });
+      return null;
+    }
     console.warn('Автопоиск статей:', describeError(err));
     // Повторим не раньше чем через пару часов; причину покажем в ленте.
     store.setMeta({ lastAttemptAt: Date.now() - 18 * 3600e3, lastDiscoverError: describeError(err) });

@@ -27,7 +27,8 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(VERSION).then((cache) => cache.addAll(SHELL)));
+  // cache: 'reload' — мимо HTTP-кэша браузера, иначе новая версия могла бы закэшировать старые файлы.
+  event.waitUntil(caches.open(VERSION).then((cache) => cache.addAll(SHELL.map((url) => new Request(url, { cache: 'reload' })))));
 });
 
 self.addEventListener('activate', (event) => {
